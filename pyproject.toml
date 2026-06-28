@@ -1,0 +1,20 @@
+[project]
+name = "llm-internals-companion"
+version = "0.1.0"
+description = "連載「言語モデルの中身」のコード（トークンから PHOTON まで）"
+requires-python = ">=3.10"
+dependencies = []
+
+# Part1-4 はローカル推論 (MLX), Part5-6 はゼロ学習 (PyTorch/MPS)。依存は extras で分離し、
+# 片方だけ入れても動くようにする。実際の version は uv.lock で pin する。
+[project.optional-dependencies]
+mlx = ["mlx-lm>=0.20"]
+torch = ["torch>=2.4"]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["llm_internals"]
