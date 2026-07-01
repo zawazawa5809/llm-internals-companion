@@ -57,3 +57,27 @@ python selftest.py
 - 機種: Apple M5 Pro 48GB / macOS
 - モデル: `mlx-community/Llama-3.2-1B-Instruct-4bit`（revision は lockfile / run-meta に記録）
 - mlx-lm: （実行時の version を run-meta に記録）
+
+## Part 2: attention_from_scratch
+
+self-attention を numpy だけで最小実装し、系列長 T に対する計算量を実測します（MLX も外部モデルも不要）。
+
+```bash
+cd examples/part_02_attention
+
+# causal attention 行列を表示（過去にだけ重みが分散・上三角=未来=0）
+python attention_from_scratch.py --demo
+
+# 系列長 T スイープ: 射影(線形)と attention コア(二乗)の wall-time を分けて計測
+python attention_from_scratch.py --bench --reps 7 --out results.jsonl
+
+# MLX 不要のロジック検証（softmax 行和=1・causal リーク無し）
+python attention_from_scratch.py --selftest
+```
+
+### 記事の数値（Apple M5 Pro / numpy 2.5.0 / d=128 / 7 rep median）
+
+- attention コア（`softmax(QKᵀ/√d)·V`）は系列長 T が 2 倍で約 4 倍（O(T²)。T=2048 で倍率 4.23）
+- Q/K/V 射影は約 2 倍（O(T)・線形）
+- スコア行列メモリは T×T×4byte（T=2048 で 16 MiB）。理論値
+- 小さい T（例 128 で倍率 2.23）では、二乗項が定数項・線形項に隠れて見えにくい（O(T²) は漸近計算量）

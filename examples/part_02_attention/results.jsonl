@@ -1,0 +1,7 @@
+{"kind": "bench", "T": 64, "d": 128, "reps": 7, "proj_ms": 0.0088, "attn_core_ms": 0.035, "total_ms": 0.044, "scores_bytes": 16384, "scores_mib": 0.016}
+{"kind": "bench", "T": 128, "d": 128, "reps": 7, "proj_ms": 0.0138, "attn_core_ms": 0.0779, "total_ms": 0.0918, "scores_bytes": 65536, "scores_mib": 0.062}
+{"kind": "bench", "T": 256, "d": 128, "reps": 7, "proj_ms": 0.0258, "attn_core_ms": 0.2558, "total_ms": 0.2815, "scores_bytes": 262144, "scores_mib": 0.25}
+{"kind": "bench", "T": 512, "d": 128, "reps": 7, "proj_ms": 0.0474, "attn_core_ms": 0.9458, "total_ms": 0.9936, "scores_bytes": 1048576, "scores_mib": 1.0}
+{"kind": "bench", "T": 1024, "d": 128, "reps": 7, "proj_ms": 0.097, "attn_core_ms": 3.9311, "total_ms": 4.0271, "scores_bytes": 4194304, "scores_mib": 4.0}
+{"kind": "bench", "T": 2048, "d": 128, "reps": 7, "proj_ms": 0.1842, "attn_core_ms": 16.6459, "total_ms": 16.8392, "scores_bytes": 16777216, "scores_mib": 16.0}
+{"kind": "run-meta", "numpy": "2.5.0", "python": "3.12.13", "platform": "macOS-26.5.1-arm64-arm-64bit", "machine": "arm64"}
