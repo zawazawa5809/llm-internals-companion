@@ -16,6 +16,9 @@ examples/part_02_attention/
   attention_from_scratch.py          # self-attention 最小実装 + 系列長 T スイープの実測
 examples/part_03_kv_cache/
   kv_cache_demo.py                   # mlx_lm の内部 KV キャッシュを introspect + context スイープの実測
+examples/part_04_sampling_self_consistency/
+  self_consistency.py                # greedy vs self-consistency(maj@N) を GSM8K で実測（bootstrap CI付き）
+  gsm8k_subset.jsonl                 # 固定 150 問（official test.jsonl の先頭150件、committed）
 pyproject.toml                       # extras: [mlx]（Part1-4）/ [torch]（Part5-6）
 ```
 
@@ -119,3 +122,41 @@ python kv_cache_demo.py --selftest
   context が2倍で KV バイト数も正確に2倍（32,768 context で 1,024 MiB = 1 GiB）
 - decode 速度: context 1,024→32,768（32倍）で 292.1 → 119.0 tok/s（約 2.45 倍低下）。新規計算量は
   context 長によらず一定なので、この低下はキャッシュ読み出しコストが効いている証拠（memory-bound）
+
+## Part 4: self_consistency
+
+GSM8K（小学校算数文章題）で、greedy（1回だけ生成）と self-consistency（temperature>0 で N 回
+サンプリングし多数決）の正答率を比較します。N=1 の基準点は greedy で別途生成し、N∈{3,5,10,20} は
+M=20 本のサンプルプールから非復元抽出した部分集合で見積もる（生成コストを N 毎に払わない標準的な
+評価トリック）。bootstrap CI で「有意な差か、ノイズ内か」を判定します。
+
+```bash
+cd examples/part_04_sampling_self_consistency
+
+# greedy 1本 + サンプル M=20本を150問全てで生成（時間がかかる。1問あたり約20-25秒 × 150問）
+python self_consistency.py --sample --model mlx-community/Qwen2.5-1.5B-Instruct-4bit \
+  --m 20 --temperature 0.7 --top-p 0.95 --out results_samples.jsonl
+
+# 保存済みサンプルから N∈{1,3,5,10,20} の maj@N 正答率を bootstrap CI 付きで算出（再生成なし）
+python self_consistency.py --analyze --in results_samples.jsonl --out results_analysis.jsonl
+
+# mlx 不要のロジック検証（answer抽出・多数決・bootstrap CI）
+python self_consistency.py --selftest
+```
+
+### データセット
+
+- `gsm8k_subset.jsonl`: 公式 [openai/grade-school-math](https://github.com/openai/grade-school-math) の
+  `test.jsonl` 先頭 150 問（committed、決定論的選択）。MIT License。
+
+### 記事の数値（Apple M5 Pro / `mlx-community/Qwen2.5-1.5B-Instruct-4bit` / mlx-lm 0.31.3 / temperature=0.7, top_p=0.95）
+
+- GSM8K 150問での maj@N 正答率（bootstrap 95% CI, 2,000 resamples）:
+  - N=1（greedy）: 54.0% [46.0%, 62.0%]
+  - N=3: 62.2% [56.5%, 67.7%]（+8.2pp）
+  - N=5: 67.9% [62.2%, 73.8%]（+5.7pp）
+  - N=10: 72.8% [66.8%, 78.8%]（+4.9pp）
+  - N=20: 76.7% [70.0%, 83.3%]（+3.9pp）— N を倍にするごとに伸びが縮む（diminishing returns）
+- コスト: N=1 は150クエリ/183.6秒、N=20 は3,000クエリ/3,672.3秒（正確に20倍）。正答率は約1.42倍にしかならない
+- 内訳: 34/150問が self-consistency で「救われた」（greedy不正解→maj@20正解）、0/150問が「悪化」（greedy正解→maj@20不正解、本実験では未観測）、6/150問はmaj@20でも不正解のまま
+- 系統的誤りの例（Q41、ドラゴンと投槍の問題）: 20本中12本が中間計算「1,200 feet」で止まり最後の引き算を飛ばして誤答。独立ノイズは多数決で均せるが、相関した系統誤りには効かない

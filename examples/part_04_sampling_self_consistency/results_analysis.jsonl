@@ -1,0 +1,6 @@
+{"kind": "maj-at-n", "n": 1, "accuracy": 0.54, "ci_lo": 0.46, "ci_hi": 0.62, "n_queries_total": 150, "est_wall_time_s": 183.6}
+{"kind": "maj-at-n", "n": 3, "accuracy": 0.6215, "ci_lo": 0.565, "ci_hi": 0.6774, "n_queries_total": 450, "est_wall_time_s": 550.9}
+{"kind": "maj-at-n", "n": 5, "accuracy": 0.6794, "ci_lo": 0.6225, "ci_hi": 0.7379, "n_queries_total": 750, "est_wall_time_s": 918.1}
+{"kind": "maj-at-n", "n": 10, "accuracy": 0.7277, "ci_lo": 0.6684, "ci_hi": 0.7885, "n_queries_total": 1500, "est_wall_time_s": 1836.2}
+{"kind": "maj-at-n", "n": 20, "accuracy": 0.7667, "ci_lo": 0.7, "ci_hi": 0.8333, "n_queries_total": 3000, "est_wall_time_s": 3672.3}
+{"kind": "run-meta", "model": "mlx-community/Qwen2.5-1.5B-Instruct-4bit", "mlx_lm": "0.31.3", "mlx": "0.31.2", "python": "3.12.13", "platform": "macOS-26.5.2-arm64-arm-64bit", "machine": "arm64", "m_samples": 20, "temperature": 0.7, "top_p": 0.95, "max_tokens": 350, "seed": 0, "analysis_of": "results_samples.jsonl"}
