@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
 import sys
 import time
@@ -49,6 +50,12 @@ def padded_length(seq_len: int, step: int = 256) -> int:
         return 0
     n_steps = (step + seq_len - 1) // step
     return n_steps * step
+
+
+def _finite(x, nd: int):
+    """非有限値 (nan/inf) は None に正規化する。JSONL に NaN を書くと下流の JSON.parse が壊れるため
+    (mlx-vs-ollama companion の bench.py と同じ不変条件)。"""
+    return round(x, nd) if isinstance(x, (int, float)) and math.isfinite(x) else None
 
 
 # --- mlx 依存部 (import は遅延させ、selftest を mlx なしで通す) -----------------------------
@@ -257,12 +264,12 @@ def bench_decode(
         rec = {
             "kind": "decode-bench",
             "context": context_len,
-            "decode_tok_s": round(tok_s, 3),
-            "first_step_ms": round(first_step_ms, 3),
+            "decode_tok_s": _finite(tok_s, 3),
+            "first_step_ms": _finite(first_step_ms, 3),
             "n_decode_samples": len(decode_steps),
         }
         records.append(rec)
-        print(f"{context_len:>8} {rec['decode_tok_s']:>13.3f} {rec['first_step_ms']:>26.2f}")
+        print(f"{context_len:>8} {tok_s:>13.3f} {first_step_ms:>26.2f}")
 
     if out_path:
         with open(out_path, "w") as f:
@@ -310,6 +317,15 @@ def selftest() -> int:
     return 0 if ok else 1
 
 
+def _parse_contexts(raw: str) -> list[int]:
+    """カンマ区切りの context 長リストをパースする。空要素(例: 末尾カンマ)は無視する。"""
+    parts = [p.strip() for p in raw.split(",")]
+    try:
+        return [int(p) for p in parts if p]
+    except ValueError as e:
+        raise SystemExit(f"--contexts の値が不正です: {raw!r} ({e})")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--probe", action="store_true", help="256境界をまたぐ細かいスイープで罠を見せる")
@@ -332,10 +348,10 @@ def main() -> None:
     if args.probe:
         probe(args.model, around=args.around, span=args.span)
     if args.kv:
-        contexts = [int(c) for c in args.contexts.split(",")]
+        contexts = _parse_contexts(args.contexts)
         bench_kv(args.model, contexts, out_path=args.out)
     if args.decode:
-        contexts = [int(c) for c in args.contexts.split(",")]
+        contexts = _parse_contexts(args.contexts)
         bench_decode(args.model, contexts, max_new_tokens=args.max_new_tokens, warmup_tokens=args.warmup_tokens, out_path=args.out)
     if not (args.probe or args.kv or args.decode or args.selftest):
         ap.print_help()
