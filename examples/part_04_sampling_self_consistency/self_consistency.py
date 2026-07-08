@@ -50,7 +50,9 @@ def extract_pred(completion: str) -> str | None:
     m = re.search(r"####\s*\$?(-?[\d,]+(?:\.\d+)?)", completion)
     if m:
         return m.group(1).replace(",", "")
-    nums = re.findall(r"-?\d[\d,]*\.?\d*", completion.replace(",", ""))
+    # completion 全体からカンマを剥がすと "12, 34" のような無関係な2数字が "1234" に融合しうるため、
+    # マッチ後(桁区切りカンマを含む1トークン)にだけ replace する。
+    nums = re.findall(r"-?\d[\d,]*\.?\d*", completion)
     return nums[-1].replace(",", "") if nums else None
 
 
@@ -65,6 +67,14 @@ def normalize(x) -> float | None:
 
 def is_correct(gold: float | None, pred: float | None, tol: float = 1e-4) -> bool:
     return gold is not None and pred is not None and abs(gold - pred) < tol
+
+
+def _finite(x, nd: int):
+    """非有限値 (nan/inf) は None に正規化する。JSONL に NaN を書くと下流の JSON.parse が壊れるため
+    (kv_cache_demo.py / mlx-vs-ollama companion の bench.py と同じ不変条件)。"""
+    import math
+
+    return round(x, nd) if isinstance(x, (int, float)) and math.isfinite(x) else None
 
 
 def majority_vote(preds: list):
@@ -257,11 +267,11 @@ def analyze(
         rec = {
             "kind": "maj-at-n",
             "n": n,
-            "accuracy": round(mean_acc, 4),
-            "ci_lo": round(lo, 4),
-            "ci_hi": round(hi, 4),
+            "accuracy": _finite(mean_acc, 4),
+            "ci_lo": _finite(lo, 4),
+            "ci_hi": _finite(hi, 4),
             "n_queries_total": n_queries,
-            "est_wall_time_s": round(est_time, 1),
+            "est_wall_time_s": _finite(est_time, 1),
         }
         results.append(rec)
         print(f"{n:>4} {mean_acc * 100:>9.1f}% {lo * 100:>7.1f}% {hi * 100:>7.1f}% {n_queries:>10} {est_time:>11.1f}")
@@ -295,6 +305,12 @@ def selftest() -> int:
         ok = False
     if extract_pred("no numbers here") is not None:
         print("FAIL: extract_pred empty")
+        ok = False
+    if extract_pred("she has 12, then buys 34 more") != "34":
+        print("FAIL: extract_pred must not fuse unrelated comma-separated numbers into one")
+        ok = False
+    if extract_pred("the total comes to 1,200 dollars") != "1200":
+        print("FAIL: extract_pred thousands-separator number")
         ok = False
 
     if normalize("72") != 72.0 or normalize(None) is not None or normalize("abc") is not None:
