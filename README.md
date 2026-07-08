@@ -8,10 +8,14 @@
 ## レイアウト
 
 ```
-llm_internals/                       # 共有ユーティリティ（最小から開始。measure 抽象化は Part3/5 で追加）
+llm_internals/                       # 共有ユーティリティ（最小から開始。measure 抽象化は Part5 で追加）
 examples/part_01_token_loop/
   token_loop.py                      # 自己回帰ループを1トークンずつ覗く + 累積 wall-time の線形を実測
   selftest.py                        # MLX 非依存のロジック検証（実機なしで通る）
+examples/part_02_attention/
+  attention_from_scratch.py          # self-attention 最小実装 + 系列長 T スイープの実測
+examples/part_03_kv_cache/
+  kv_cache_demo.py                   # mlx_lm の内部 KV キャッシュを introspect + context スイープの実測
 pyproject.toml                       # extras: [mlx]（Part1-4）/ [torch]（Part5-6）
 ```
 
@@ -81,3 +85,37 @@ python attention_from_scratch.py --selftest
 - Q/K/V 射影は約 2 倍（O(T)・線形）
 - スコア行列メモリは T×T×4byte（T=2048 で 16 MiB）。理論値
 - 小さい T（例 128 で倍率 2.23）では、二乗項が定数項・線形項に隠れて見えにくい（O(T²) は漸近計算量）
+
+## Part 3: kv_cache_demo
+
+mlx_lm の内部 KV キャッシュ実装（`KVCache`）を直接 introspect し、キャッシュサイズが context 長に線形で
+効くこと、そして decode 速度が計算量ではなくキャッシュの読み出し量で決まる（memory-bound）ことを実測します。
+
+```bash
+cd examples/part_03_kv_cache
+
+# 256 境界をまたぐ細かいスイープで「罠」(raw nbytes の階段関数) を見せる
+python kv_cache_demo.py --probe --around 256 --span 6
+
+# context 1K-32K で KV バイト数を実測（理論式・論理長・確保容量の三点一致）
+python kv_cache_demo.py --kv --contexts 1024,2048,4096,8192,16384,32768 --out results_kv.jsonl
+
+# context 1K-32K で decode tok/s を実測（memory-bound の実測）
+python kv_cache_demo.py --decode --contexts 1024,2048,4096,8192,16384,32768 --out results_decode.jsonl
+
+# mlx 不要のロジック検証（理論式・padding 計算）
+python kv_cache_demo.py --selftest
+```
+
+### 記事の数値（Apple M5 Pro / mlx-lm 0.31.3 / mlx 0.31.2 / `mlx-community/Llama-3.2-1B-Instruct-4bit`）
+
+- モデル構成: n_layers=16, n_heads=32, **n_kv_heads=8**, head_dim=64（GQA group factor = 4）。KV キャッシュの
+  dtype は fp16（重みが 4bit 量子化でも KV は既定で fp16 のまま）
+- **「罠」**: mlx_lm の `KVCache` は `step=256` 単位でキャッシュ配列を事前確保する（`mlx_lm/models/cache.py`
+  を直読して確認）。`.nbytes` は確保容量ベースなので、context が 256→257 と 1 トークン増えただけで
+  8.0 MiB → 16.0 MiB（ちょうど2倍）にジャンプする。論理長（`offset`）でスライスした実データは
+  8.000 → 8.031 MiB としか増えない
+- context 1,024〜32,768（256 の倍数）では raw（確保容量）・state（論理長）・理論式の 3 つが完全一致し、
+  context が2倍で KV バイト数も正確に2倍（32,768 context で 1,024 MiB = 1 GiB）
+- decode 速度: context 1,024→32,768（32倍）で 292.1 → 119.0 tok/s（約 2.45 倍低下）。新規計算量は
+  context 長によらず一定なので、この低下はキャッシュ読み出しコストが効いている証拠（memory-bound）
