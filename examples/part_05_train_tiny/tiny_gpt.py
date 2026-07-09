@@ -10,12 +10,18 @@ bits-per-char・所要時間・ピークメモリを実測する。
   - **データ**: TinyShakespeare（`input.txt`, karpathy/char-rnn 由来, ライセンス表記なし=出典明記のうえ
     教育目的として使用）。char-level tokenizer（1 文字 = 1 トークン）。
   - **MPS の注意点**: bf16 autocast は環境によって不安定という報告があるため fp32 を既定にする。
+    `--dtype` は float32 既定、float16/bfloat16 を指定した場合のみ実際に `torch.autocast` で forward
+    に反映する（値を受け取るだけで forward に反映されない、という不整合は起こさない）。
     `PYTORCH_ENABLE_MPS_FALLBACK=1` を既定で有効にし、未対応演算があれば CPU にフォールバックさせる
     （フォールバックが発生した場合は run-meta に `mps_fallback_triggered=true` として記録し、計測値が
     汚染されている可能性を明示する）。
   - **メモリ計測**: torch.mps には CUDA の `max_memory_allocated()` に相当する peak tracker が無いため、
-    `torch.mps.current_allocated_memory()` を各評価チェックポイントでサンプリングし、その最大値を
-    peak の近似値として報告する（この方法であることを run-meta に明記する）。
+    `torch.mps.current_allocated_memory()` を毎 iteration（backward+optimizer.step 直後、勾配とoptimizer
+    状態が確保された直後）でサンプリングし、その最大値を peak の近似値として報告する（この方法であることを
+    run-meta に明記する）。
+  - **RNG の分離**: 学習バッチ用と評価バッチ用で別の Generator を使う。同じ Generator を共有すると
+    `--eval-iters` を変えるだけで消費される乱数列がずれ、学習バッチの抽選順（＝学習軌跡そのもの）が
+    変わってしまうため。
   - **数値は環境依存**: 所要時間・ピークメモリは machine・torch バージョンに依存する。run-meta に記録し、
     一般化しない（free ≠ fast の系譜）。
 """
@@ -23,13 +29,14 @@ bits-per-char・所要時間・ピークメモリを実測する。
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import platform
 import time
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -195,13 +202,31 @@ def get_batch(
 
 
 def perplexity(loss_nats: float) -> float:
-    """PPL = exp(cross-entropy loss in nats)。"""
-    return math.exp(loss_nats)
+    """PPL = exp(cross-entropy loss in nats)。loss が発散した場合 math.exp は OverflowError を
+    投げうるため inf に丸める（呼び出し側は _finite() で JSON-safe な None に正規化する）。"""
+    try:
+        return math.exp(loss_nats)
+    except OverflowError:
+        return math.inf
 
 
 def bits_per_char(loss_nats: float) -> float:
     """BPC = loss(nats) / ln(2)。PPL と同じ量を bits 単位で表したもの。"""
     return loss_nats / math.log(2)
+
+
+def _finite(x, nd: int = 6):
+    """非有限値 (nan/inf) は None に正規化する。JSONL に NaN/Infinity を書くと下流の JSON.parse が壊れるため
+    (kv_cache_demo.py / self_consistency.py と同じ不変条件)。"""
+    return round(x, nd) if isinstance(x, (int, float)) and math.isfinite(x) else None
+
+
+def amp_context(device: torch.device, dtype_name: str):
+    """--dtype float32 (既定) では no-op。float16/bfloat16 を指定した場合のみ実際に autocast する
+    （以前は --dtype を受け取っても forward に反映されず、run-meta にだけ値が記録される不整合があった）。"""
+    if dtype_name == "float32":
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device.type, dtype=getattr(torch, dtype_name))
 
 
 @torch.no_grad()
@@ -213,12 +238,14 @@ def estimate_loss(
     device: torch.device,
     generator: torch.Generator,
     eval_iters: int,
+    dtype_name: str = "float32",
 ) -> float:
     model.eval()
     losses = []
     for _ in range(eval_iters):
         x, y = get_batch(data, block_size, batch_size, device, generator)
-        _, loss = model(x, y)
+        with amp_context(device, dtype_name):
+            _, loss = model(x, y)
         losses.append(loss.item())
     model.train()
     return sum(losses) / len(losses)
@@ -253,7 +280,7 @@ def run_meta(args: argparse.Namespace, model: TinyGPT, device: torch.device, mps
         "mps_available": torch.backends.mps.is_available(),
         "mps_fallback_env": os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0"),
         "mps_fallback_triggered": mps_fallback_triggered,
-        "peak_mem_method": "current_allocated_memory() sampled at each eval checkpoint, max taken as peak approximation (torch.mps has no CUDA-equivalent peak tracker)",
+        "peak_mem_method": "current_allocated_memory() sampled every iteration right after backward()+optimizer.step(), max taken as peak approximation (torch.mps has no CUDA-equivalent peak tracker)",
     }
 
 
@@ -271,7 +298,12 @@ def train(args: argparse.Namespace) -> None:
         )
 
     torch.manual_seed(args.seed)
+    if device.type == "mps":
+        torch.mps.manual_seed(args.seed)
+    # 学習バッチ用と評価バッチ用で Generator を分離する（同一 Generator だと --eval-iters を
+    # 変えただけで学習バッチの抽選順がずれ、学習軌跡そのものが変わってしまうため）。
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    eval_generator = torch.Generator(device="cpu").manual_seed(args.seed + 1)
 
     tok, train_data, val_data = load_data(Path(args.data))
     config = GPTConfig(
@@ -297,37 +329,55 @@ def train(args: argparse.Namespace) -> None:
         t0 = time.time()
         for it in range(args.max_iters):
             x, y = get_batch(train_data, args.block_size, args.batch_size, device, generator)
-            _, loss = model(x, y)
+            with amp_context(device, args.dtype):
+                _, loss = model(x, y)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+
+            if device.type == "mps":
+                # backward+optimizer.step 直後（勾配・optimizer状態が確保された直後）にサンプリングする。
+                # 評価チェックポイントでしか読まないと、その時点では勾配バッファが既に解放されており
+                # 実際のピーク（backward中）を過小評価しうる。同期なしで読める軽量な呼び出しなので
+                # 毎 iteration サンプリングしてもコストは無視できる。
+                peak_mem_bytes = max(peak_mem_bytes, torch.mps.current_allocated_memory())
 
             if it % args.eval_interval == 0 or it == args.max_iters - 1:
                 if device.type == "mps":
                     torch.mps.synchronize()
                 train_loss = estimate_loss(
-                    model, train_data, args.block_size, args.batch_size, device, generator, args.eval_iters
+                    model,
+                    train_data,
+                    args.block_size,
+                    args.batch_size,
+                    device,
+                    eval_generator,
+                    args.eval_iters,
+                    args.dtype,
                 )
                 val_loss = estimate_loss(
-                    model, val_data, args.block_size, args.batch_size, device, generator, args.eval_iters
+                    model,
+                    val_data,
+                    args.block_size,
+                    args.batch_size,
+                    device,
+                    eval_generator,
+                    args.eval_iters,
+                    args.dtype,
                 )
                 elapsed = time.time() - t0
-                if device.type == "mps":
-                    current_mem = torch.mps.current_allocated_memory()
-                    peak_mem_bytes = max(peak_mem_bytes, current_mem)
-                else:
-                    current_mem = None
+                current_mem = torch.mps.current_allocated_memory() if device.type == "mps" else None
 
                 rec = {
                     "kind": "train-step",
                     "iter": it,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "train_ppl": perplexity(train_loss),
-                    "val_ppl": perplexity(val_loss),
-                    "train_bpc": bits_per_char(train_loss),
-                    "val_bpc": bits_per_char(val_loss),
-                    "elapsed_s": elapsed,
+                    "train_loss": _finite(train_loss),
+                    "val_loss": _finite(val_loss),
+                    "train_ppl": _finite(perplexity(train_loss)),
+                    "val_ppl": _finite(perplexity(val_loss)),
+                    "train_bpc": _finite(bits_per_char(train_loss)),
+                    "val_bpc": _finite(bits_per_char(val_loss)),
+                    "elapsed_s": _finite(elapsed, 1),
                     "current_mem_bytes": current_mem,
                 }
                 records.append(rec)
@@ -401,10 +451,31 @@ def selftest() -> int:
     if abs(bits_per_char(math.log(2)) - 1.0) > 1e-9:
         failures.append(f"bits_per_char(ln2)が1でない: {bits_per_char(math.log(2))}")
 
-    # causal mask: 未来位置への attention 重みは 0 のはず(register_bufferの整合性チェック)
+    # causal mask バッファ自体が下三角になっているか(構造チェック)
     attn = model.blocks[0].attn
     if attn.causal_mask[0, 0, 0, 1].item() != 0:
         failures.append("causal_mask が下三角になっていない")
+
+    # causal mask が forward で実際に効いているか(end-to-endチェック)。
+    # 上のバッファチェックだけだと、forward内でスライス方向を間違えていても検出できない。
+    # 位置0のlogitsは、位置0より後ろのトークンを変えても不変であるべき(未来は見えない)。
+    model.eval()
+    with torch.no_grad():
+        base = torch.randint(0, tok.vocab_size, (1, 8))
+        perturbed = base.clone()
+        perturbed[0, 4:] = (perturbed[0, 4:] + 1) % tok.vocab_size
+        logits_base, _ = model(base)
+        logits_perturbed, _ = model(perturbed)
+        if not torch.allclose(logits_base[0, 0], logits_perturbed[0, 0], atol=1e-5):
+            failures.append("causality違反: 未来トークンの変更で過去位置のlogitsが変化した")
+    model.train()
+
+    # get_batch: y は x を1つ右にずらしたものであるべき(next-token予測の根幹、off-by-one混入の典型箇所)
+    data = torch.arange(100, dtype=torch.long)
+    gen = torch.Generator(device="cpu").manual_seed(0)
+    bx, by = get_batch(data, block_size=8, batch_size=4, device=torch.device("cpu"), generator=gen)
+    if not torch.equal(by, bx + 1):
+        failures.append(f"get_batch: y が x+1(次の文字)になっていない: x[0]={bx[0].tolist()} y[0]={by[0].tolist()}")
 
     if failures:
         print("SELFTEST FAILED:")
@@ -413,7 +484,7 @@ def selftest() -> int:
         return 1
     print(
         "SELFTEST PASSED (tokenizer roundtrip / forward shape / 過学習でloss減少 "
-        "/ perplexity・bpc定義 / causal mask整合)"
+        "/ perplexity・bpc定義 / causal mask整合(バッファ+forward経路のend-to-end) / get_batchのnext-token整合)"
     )
     return 0
 
@@ -425,8 +496,11 @@ def selftest() -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--train", action="store_true", help="学習ループを実行し results.jsonl に記録する")
-    ap.add_argument("--selftest", action="store_true", help="torch非依存ではないが実機(MPS実走)なしで通るロジック検証")
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--train", action="store_true", help="学習ループを実行し results.jsonl に記録する")
+    mode.add_argument(
+        "--selftest", action="store_true", help="torch非依存ではないが実機(MPS実走)なしで通るロジック検証"
+    )
     ap.add_argument("--data", type=str, default=DEFAULT_DATA)
     ap.add_argument("--out", type=str, default=DEFAULT_OUT)
     ap.add_argument("--device", type=str, default="mps" if torch.backends.mps.is_available() else "cpu")
@@ -446,10 +520,7 @@ def main() -> None:
 
     if args.selftest:
         raise SystemExit(selftest())
-    if args.train:
-        train(args)
-        return
-    ap.print_help()
+    train(args)
 
 
 if __name__ == "__main__":
