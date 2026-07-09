@@ -6,3 +6,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Claude Code local state (not repo content)
+.claude/

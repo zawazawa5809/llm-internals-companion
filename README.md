@@ -8,7 +8,7 @@
 ## レイアウト
 
 ```
-llm_internals/                       # 共有ユーティリティ（最小から開始。measure 抽象化は Part5 で追加）
+llm_internals/                       # 共有ユーティリティ（Part1-4は各exampleで完結。Part5/6共有はexampleの直接importで行う）
 examples/part_01_token_loop/
   token_loop.py                      # 自己回帰ループを1トークンずつ覗く + 累積 wall-time の線形を実測
   selftest.py                        # MLX 非依存のロジック検証（実機なしで通る）
@@ -19,6 +19,9 @@ examples/part_03_kv_cache/
 examples/part_04_sampling_self_consistency/
   self_consistency.py                # greedy vs self-consistency(maj@N) を GSM8K で実測（bootstrap CI付き）
   gsm8k_subset.jsonl                 # 固定 150 問（official test.jsonl の先頭150件、committed）
+examples/part_05_train_tiny/
+  tiny_gpt.py                        # decoder-only Transformer をゼロから学習 + train/val loss・PPL・BPC・メモリ実測
+  input.txt                          # TinyShakespeare（karpathy/char-rnn由来、40,000行・1.1MB）
 pyproject.toml                       # extras: [mlx]（Part1-4）/ [torch]（Part5-6）
 ```
 
@@ -160,3 +163,55 @@ python self_consistency.py --selftest
 - コスト: N=1 は150クエリ/183.6秒、N=20 は3,000クエリ/3,672.3秒（正確に20倍）。正答率は約1.42倍にしかならない
 - 内訳: 34/150問が self-consistency で「救われた」（greedy不正解→maj@20正解）、0/150問が「悪化」（greedy正解→maj@20不正解、本実験では未観測）、35/150問はmaj@20でも不正解のまま（うち6問は20本中10本以上が同じ誤答=系統的、残り17問は票が分散する独立ノイズ寄り）
 - 系統的誤りの例（Q41、ドラゴンと投槍の問題）: 20本中12本が中間計算「1,200 feet」で止まり最後の引き算を飛ばして誤答（同一設定で再生成したcompletion本文を読んで確認済み）。独立ノイズは多数決で均せるが、相関した系統誤りには効かない
+
+## Part 5: tiny_gpt
+
+Part 1-4 は既存モデルの重みを使った推論だけを扱ってきました。Part 5 では nanoGPT 級（Karpathy 標準
+config: n_layer=6, n_head=6, n_embd=384, block_size=256, ≈10.6M params）の decoder-only Transformer を
+TinyShakespeare で **ゼロから学習** し、train/val loss・perplexity・bits-per-char・所要時間・ピーク
+メモリを実測します。
+
+```bash
+cd examples/part_05_train_tiny
+# torch を追加導入（mlx extraと共存させる。--extra torch 単体だと mlx が入れ替わりで消えるため注意）
+uv sync --extra mlx --extra torch --extra dev
+
+# 標準config（Karpathy nanoGPT 相当, ≈10.6M params）で学習。fp32既定・MPS優先
+python tiny_gpt.py --train --out results.jsonl
+
+# 学習パラメータを変える場合の例（縮小config・短時間で様子を見る）
+python tiny_gpt.py --train --n-layer 4 --n-head 4 --n-embd 128 --block-size 64 \
+  --max-iters 2000 --out results_small.jsonl
+
+# torch実装のロジック検証（実機=MPS実走なしでCPU上で通る。tokenizer roundtrip/forward shape/過学習でloss減少/PPL・BPC定義/causal mask整合）
+python tiny_gpt.py --selftest
+```
+
+### データセット
+
+- `input.txt`: TinyShakespeare（[karpathy/char-rnn](https://github.com/karpathy/char-rnn/blob/master/data/tinyshakespeare/input.txt)
+  由来、約40,000行・1.11MB）。**ライセンス表記は "More Information Needed"（不明）** —
+  Hugging Face の dataset card でも明確なライセンスは確認できないため、出典と教育目的での広範な
+  利用実績（nanoGPT/char-rnn 双方の公式サンプル）を明記した上で使用する。
+
+### 再現性・計測方法の注記（このリポジトリの不変条件）
+
+- **fp32 既定**: MPS の bf16 autocast は環境によって不安定という報告があるため（`01_research.md`
+  参照）、`--dtype float32` を既定にする。`PYTORCH_ENABLE_MPS_FALLBACK=1` を既定で有効にし、未対応
+  演算が発生した場合は `warnings` を捕捉して `run-meta.mps_fallback_triggered` に記録する（発火時は
+  計測値の一部がCPU実行分を含む可能性があるフラグとして機能する）。
+- **ピークメモリの近似**: `torch.mps` には CUDA の `max_memory_allocated()` に相当する peak tracker が
+  無い。`torch.mps.current_allocated_memory()` を各評価チェックポイントでサンプリングし、その最大値を
+  peak の近似値として `run-meta.peak_mem_bytes` に記録する（近似方法であることを `run-meta.peak_mem_method`
+  に明記）。
+- **MLX(Part1-4) と PyTorch(Part5-6) の指標は混ぜない**: メモリ・スループットの定義がライブラリ間で
+  異なるため、別建てで報告する。
+
+### 記事の数値（実機実走待ち）
+
+- **未確定**: 実際の学習実走はザワが Apple M5 Pro 48GB 上で行う（このリポジトリの数値は他者ベンチの
+  引用ではなく自分で測ったものにする、という連載全体の方針に基づく）。実走完了後、train/val loss 曲線・
+  perplexity・bits-per-char・所要時間・ピークメモリの実測値をここに追記する。
+- 参考値（nanoGPT公式ベンチマーク、A100 GPU実測・自分の実測ではないため直接引用しない）: 標準config
+  で validation loss 1.4697（`01_research.md` 参照）。GPU と MPS では収束曲線・所要時間が異なりうる点に
+  留意する。
