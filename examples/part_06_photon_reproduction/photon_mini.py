@@ -292,17 +292,25 @@ class PhotonMini(nn.Module):
         戻り値: (生成後の token 列, KVメモリ実測ログ)。ログには各chunk生成直後の
         「保持しているcoarse cache (KV_le_g相当) のバイト数」を記録する — 理論上 O(g) で増える。
 
-        **KV bytesの定義について (code-review指摘への対応)**: 論文 p.4-5 は PHOTON の global KV cache を
-        「レベルlのM_l個のlatent単位に対するkeys/valuesの保存」と定義している。これは vanilla の KV cache
-        (2×n_layer×n_head×head_dim×T×dtype_bytes) と同じ「multi-head attentionのK/Vペア」という土台の量である。
-        本実装の context_encoder はチャンク列に対するcausal self-attention (n_layer_encoder層) なので、
-        その理論的なKV cacheサイズは vanilla と全く同じ式の変数を置き換えるだけで求まる:
-        2×n_layer_encoder×n_head_encoder×head_dim_encoder×M×dtype_bytes (Mはchunk数)。
-        以前の実装は「chunk出力ベクトル(1個/chunk, D次元)の生バイト数」を代用していたが、これは
-        vanilla側のK+V・全層・全headを含む量とは異なる土台の値であり、比較として不適切だった
-        (vanilla側の実測: T個のK/Vペア×全層×全head vs 旧実装: M個の出力ベクトルのみ)。
-        vanilla側もtiny_gpt.pyはKVキャッシュを実装していないため理論式で計算しており(generate_vanilla参照)、
-        本関数も同じ理論式のスタイルで揃えることで初めて同じ土台の比較になる。
+        **KV bytesの定義について (code-review指摘への対応、2回目)**: 論文 p.4-5 は PHOTON の global KV
+        cache を「レベルlのM_l個のlatent単位に対するkeys/valuesの保存」と定義している。これは vanilla の
+        KV cache (2×n_layer×n_head×head_dim×T×dtype_bytes) と同じ「multi-head attentionのK/Vペア」という
+        土台の量である。本実装の context_encoder はチャンク列に対するcausal self-attention
+        (n_layer_encoder層) なので、その理論的なKV cacheサイズは vanilla と全く同じ式の変数を置き換える
+        だけで求まる: 2×n_layer_encoder×n_head_encoder×head_dim_encoder×M×dtype_bytes (Mはchunk数)。
+
+        これに加えて、**現在decode中のchunkのlocal decoder KVキャッシュ**も同時に保持される必要がある
+        (論文 p.4: 各local decoderの attention span は R_l+C_l に固定=O(1)。1回目のcode-review修正では
+        これを含めておらず過小評価だった、との指摘を受けて追加)。local decoder cache は
+        2×n_layer_decoder×n_head_decoder×head_dim_decoder×(R+C)×dtype_bytes で、chunk境界ごとに
+        破棄される定数サイズ (Mに依存しない)。PhotonMiniの総メモリ = global cache(M) + local cache(定数)。
+
+        **これはあくまで理論上のKVキャッシュサイズ**であり、vanilla・photon_miniのどちらも実際に
+        KVキャッシュを保持する実装はしていない (毎回素朴に forward するのみ。tiny_gpt.pyと同じ)。
+        したがってスループット実測(実際にはキャッシュなしの再計算コスト)と、このメモリ理論値
+        (キャッシュ実装があった場合の見積もり)は測定条件が異なる。両者を単純に掛け合わせた
+        「TPM」は論文の一貫した実測系での TPM とは異なる粗い目安に過ぎないことを本文で明記する
+        (2回目のcode-review指摘への対応)。
         """
         cfg = self.config
         device = idx.device
@@ -324,14 +332,26 @@ class PhotonMini(nn.Module):
 
         n_new_chunks = max_new_tokens // cfg.chunk_size
         head_dim_encoder = cfg.n_embd // cfg.n_head_encoder
+        head_dim_decoder = cfg.n_embd // cfg.n_head_decoder
         bytes_per_elem = 4  # fp32
+        # local decoder cache: 現在decode中のchunkのあいだだけ保持される定数サイズ (Mに依存しない)。
+        # docstring参照 (2回目のcode-review指摘: 1回目の修正はglobal cacheのみでlocal cacheが抜けていた)。
+        local_decoder_cache_bytes = 2 * cfg.n_layer_decoder * cfg.n_head_decoder * head_dim_decoder * cfg.local_window * bytes_per_elem
         for _ in range(n_new_chunks):
-            # coarse cache のバイト数: context_encoder (causal self-attention, n_layer_encoder層) が
-            # 理論上必要とするKVキャッシュサイズ (vanilla側と同じ式の変数を置き換えたもの)。
-            # 「生のchunk出力ベクトルのバイト数」ではない (旧実装の不備。docstring参照)。
+            # coarse cache のバイト数: context_encoder (causal self-attention, n_layer_encoder層) の
+            # 理論上のKVキャッシュサイズ (global, Mに応じて増加) + local decoder の理論上のKVキャッシュ
+            # サイズ (現在decode中のchunkの分、定数)。vanilla側と同じ「総メモリ」の土台で比較する。
             m = len(coarse_states)
-            cache_bytes = 2 * cfg.n_layer_encoder * cfg.n_head_encoder * head_dim_encoder * m * bytes_per_elem
-            mem_log.append({"n_coarse_states": m, "coarse_cache_bytes": cache_bytes})
+            global_cache_bytes = 2 * cfg.n_layer_encoder * cfg.n_head_encoder * head_dim_encoder * m * bytes_per_elem
+            cache_bytes = global_cache_bytes + local_decoder_cache_bytes
+            mem_log.append(
+                {
+                    "n_coarse_states": m,
+                    "global_cache_bytes": global_cache_bytes,
+                    "local_decoder_cache_bytes": local_decoder_cache_bytes,
+                    "coarse_cache_bytes": cache_bytes,
+                }
+            )
 
             prev_state = coarse_states[-1]  # (B,1,D) 直前chunkのcoarse state
             u_prev = self.converter(prev_state).squeeze(1)  # (B,R,D)
