@@ -654,7 +654,7 @@ def measure_efficiency(args: argparse.Namespace) -> None:
 
     print(f"photon_mini params={photon_model.num_params():,} / vanilla params={vanilla_model.num_params():,}")
 
-    gen_len = photon_cfg.chunk_size * 4
+    gen_len = photon_cfg.chunk_size * 8  # 計測窓を長めにとりtimingノイズを減らす
     # context_encoder の pos_emb は n_chunks=block_size/chunk_size 個の位置しか持たないため、
     # 生成後の総chunk数 (prompt由来+新規4chunk) が n_chunks を超えないよう ctx_len を block_size-gen_len に制限する
     # (vanilla側は generate_vanilla 内で block_size window にクリップして同じ問題を回避している)
@@ -664,37 +664,61 @@ def measure_efficiency(args: argparse.Namespace) -> None:
         if photon_cfg.chunk_size * k + gen_len <= photon_cfg.block_size
     ]
     records: list[dict] = []
+    n_reps = args.efficiency_reps
 
     for ctx_len in context_lengths:
-        prompt = torch.randint(0, tok.vocab_size, (1, ctx_len), device=device)
+        photon_tok_s_samples: list[float] = []
+        van_tok_s_samples: list[float] = []
+        photon_peak_kv_bytes = van_peak_kv_bytes = None
 
-        t0 = time.time()
-        _, hier_mem_log = photon_model.generate_hiergen(prompt, max_new_tokens=gen_len)
-        photon_elapsed = time.time() - t0
-        photon_tok_s = gen_len / photon_elapsed if photon_elapsed > 0 else None
-        photon_peak_kv_bytes = max(m["coarse_cache_bytes"] for m in hier_mem_log)
+        for _rep in range(n_reps):
+            prompt = torch.randint(0, tok.vocab_size, (1, ctx_len), device=device)
 
-        t0 = time.time()
-        _, van_mem_log = generate_vanilla(vanilla_model, prompt, max_new_tokens=gen_len)
-        van_elapsed = time.time() - t0
-        van_tok_s = gen_len / van_elapsed if van_elapsed > 0 else None
-        van_peak_kv_bytes = max(m["kv_cache_bytes_theoretical"] for m in van_mem_log)
+            t0 = time.time()
+            _, hier_mem_log = photon_model.generate_hiergen(prompt, max_new_tokens=gen_len)
+            if device.type == "mps":
+                torch.mps.synchronize()
+            photon_elapsed = time.time() - t0
+            if photon_elapsed > 0:
+                photon_tok_s_samples.append(gen_len / photon_elapsed)
+            photon_peak_kv_bytes = max(m["coarse_cache_bytes"] for m in hier_mem_log)
+
+            t0 = time.time()
+            _, van_mem_log = generate_vanilla(vanilla_model, prompt, max_new_tokens=gen_len)
+            if device.type == "mps":
+                torch.mps.synchronize()
+            van_elapsed = time.time() - t0
+            if van_elapsed > 0:
+                van_tok_s_samples.append(gen_len / van_elapsed)
+            van_peak_kv_bytes = max(m["kv_cache_bytes_theoretical"] for m in van_mem_log)
+
+        photon_tok_s_samples.sort()
+        van_tok_s_samples.sort()
+        photon_tok_s = photon_tok_s_samples[len(photon_tok_s_samples) // 2] if photon_tok_s_samples else None
+        van_tok_s = van_tok_s_samples[len(van_tok_s_samples) // 2] if van_tok_s_samples else None
 
         rec = {
             "kind": "efficiency-point",
             "context_len": ctx_len,
             "gen_len": gen_len,
-            "photon_tok_per_s": _finite(photon_tok_s),
-            "vanilla_tok_per_s": _finite(van_tok_s),
+            "n_reps": n_reps,
+            "photon_tok_per_s_median": _finite(photon_tok_s),
+            "vanilla_tok_per_s_median": _finite(van_tok_s),
+            "photon_tok_per_s_samples": [_finite(x) for x in photon_tok_s_samples],
+            "vanilla_tok_per_s_samples": [_finite(x) for x in van_tok_s_samples],
             "photon_peak_kv_bytes": photon_peak_kv_bytes,
             "vanilla_peak_kv_bytes": van_peak_kv_bytes,
             "kv_bytes_reduction_x": _finite(van_peak_kv_bytes / photon_peak_kv_bytes) if photon_peak_kv_bytes else None,
+            "throughput_reduction_x": _finite(photon_tok_s / van_tok_s) if van_tok_s else None,
+            "tpm_improvement_x": _finite((photon_tok_s / photon_peak_kv_bytes) / (van_tok_s / van_peak_kv_bytes))
+            if van_tok_s and photon_tok_s and photon_peak_kv_bytes
+            else None,
         }
         records.append(rec)
         print(
-            f"context={ctx_len:4d} | photon {photon_tok_s:7.2f} tok/s, KV={photon_peak_kv_bytes:8d}B "
+            f"context={ctx_len:4d} (n={n_reps} median) | photon {photon_tok_s:7.2f} tok/s, KV={photon_peak_kv_bytes:8d}B "
             f"| vanilla {van_tok_s:7.2f} tok/s, KV={van_peak_kv_bytes:8d}B "
-            f"| KV削減率={rec['kv_bytes_reduction_x']}"
+            f"| KV削減率={rec['kv_bytes_reduction_x']} | TPM改善率={rec['tpm_improvement_x']}"
         )
 
     with open(args.out, "w") as f:
@@ -738,6 +762,7 @@ def main() -> None:
     ap.add_argument("--max-iters", type=int, default=5000)
     ap.add_argument("--eval-interval", type=int, default=250)
     ap.add_argument("--eval-iters", type=int, default=50)
+    ap.add_argument("--efficiency-reps", type=int, default=5, help="--measure-efficiency の各context長での反復回数(median採用)")
     args = ap.parse_args()
 
     if args.selftest:
